@@ -1,0 +1,12 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ci:
+    uses: GENIEMARKETING/.github/.github/workflows/ci.yml@main
+    secrets: inherit

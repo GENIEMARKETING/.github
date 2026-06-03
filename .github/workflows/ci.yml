@@ -1,0 +1,112 @@
+name: Reusable CI
+
+# The org-wide gate DAG every client site references:
+#   typecheck → Biome → Playwright + axe → Lighthouse-CI → gitleaks
+# A new enforced check added here applies to every repo at once.
+#
+# Caller usage (in a site repo, .github/workflows/ci.yml):
+#   jobs:
+#     ci:
+#       uses: GENIEMARKETING/.github/.github/workflows/ci.yml@main
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        type: string
+        default: "22"
+      build-command:
+        type: string
+        default: "pnpm build"
+      start-command:
+        description: "Command that boots the app for Lighthouse (e.g. pnpm start)."
+        type: string
+        default: "pnpm start"
+      lighthouse-url:
+        description: "URL Lighthouse-CI collects against once the app is up."
+        type: string
+        default: "http://localhost:3000"
+      run-lighthouse:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: typecheck · lint · test · a11y
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+          registry-url: https://npm.pkg.github.com
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Biome (lint + format)
+        run: pnpm exec biome ci .
+
+      - name: Build
+        run: ${{ inputs.build-command }}
+
+      - name: Install Playwright browsers
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Playwright + axe
+        run: pnpm exec playwright test
+
+  lighthouse:
+    name: Lighthouse-CI budgets
+    if: ${{ inputs.run-lighthouse }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+          registry-url: https://npm.pkg.github.com
+      - name: Install
+        run: pnpm install --frozen-lockfile
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build
+        run: ${{ inputs.build-command }}
+      - name: Lighthouse-CI
+        run: |
+          pnpm exec lhci autorun \
+            --collect.startServerCommand="${{ inputs.start-command }}" \
+            --collect.url="${{ inputs.lighthouse-url }}"
+        env:
+          LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+  secrets-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

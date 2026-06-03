@@ -1,0 +1,7 @@
+{
+  "name": "Vinny CI (reusable gate DAG)",
+  "description": "Typecheck → Biome → Playwright + axe → Lighthouse-CI → gitleaks via the org reusable workflow.",
+  "iconName": "octicon shield-check",
+  "categories": ["Continuous integration"],
+  "filePatterns": ["package\\.json$"]
+}
