@@ -1,14 +1,25 @@
 name: Reusable CI
 
 # The org-wide gate DAG every client site references:
-#   typecheck → Biome → Playwright + axe → Lighthouse-CI → gitleaks
+#   typecheck → Biome → Playwright + axe → Lighthouse-CI → gitleaks → mistakes-registry
 # A new enforced check added here applies to every repo at once.
+#
+# Design notes:
+#   - 100% OSS, no paid services. gitleaks runs from the upstream binary
+#     (the gitleaks-action requires a paid GITLEAKS_LICENSE on org repos, so we
+#     avoid it). Lighthouse-CI and axe are OSS.
+#   - Adopt-anywhere: typecheck / build / e2e auto-skip when the repo does not
+#     define them, so a library monorepo (vinny-platform) and a Next.js site can
+#     both call this same workflow. Biome + gitleaks are the always-on floor.
 #
 # Caller usage (in a site repo, .github/workflows/ci.yml):
 #   jobs:
 #     ci:
 #       uses: GENIEMARKETING/.github/.github/workflows/ci.yml@main
 #       secrets: inherit
+#       with:
+#         run-e2e: true          # set false for non-Playwright repos
+#         run-lighthouse: true   # set false for libraries / non-served repos
 
 on:
   workflow_call:
@@ -27,7 +38,15 @@ on:
         description: "URL Lighthouse-CI collects against once the app is up."
         type: string
         default: "http://localhost:3000"
+      run-e2e:
+        description: "Run Playwright + axe. Auto-skips anyway if no playwright config is found."
+        type: boolean
+        default: true
       run-lighthouse:
+        type: boolean
+        default: true
+      run-registry-checks:
+        description: "Run promoted mistakes-registry checks (S1 hook)."
         type: boolean
         default: true
 
@@ -40,7 +59,7 @@ concurrency:
 
 jobs:
   quality:
-    name: typecheck · lint · test · a11y
+    name: typecheck · lint · build · a11y
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,19 +77,34 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # --if-present makes the floor adopt-anywhere: a repo that hasn't defined
+      # the script yet is skipped rather than failing the whole org gate.
       - name: Typecheck
-        run: pnpm typecheck
+        run: pnpm run typecheck --if-present
 
-      - name: Biome (lint + format)
+      - name: Biome (lint + format)  # always-on floor
         run: pnpm exec biome ci .
 
       - name: Build
         run: ${{ inputs.build-command }}
 
+      - name: Detect Playwright
+        id: pw
+        run: |
+          if [ "${{ inputs.run-e2e }}" = "true" ] && \
+             ls playwright.config.* packages/*/playwright.config.* apps/*/playwright.config.* >/dev/null 2>&1; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Playwright config found (or run-e2e=false) — skipping e2e/a11y."
+          fi
+
       - name: Install Playwright browsers
+        if: steps.pw.outputs.present == 'true'
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Playwright + axe
+        if: steps.pw.outputs.present == 'true'
         run: pnpm exec playwright test
 
   lighthouse:
@@ -97,16 +131,44 @@ jobs:
             --collect.startServerCommand="${{ inputs.start-command }}" \
             --collect.url="${{ inputs.lighthouse-url }}"
         env:
+          # Optional: status-check posting. Lighthouse-CI itself is OSS and runs
+          # without it; the budget assertions still fail the job on regression.
           LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
 
   secrets-scan:
-    name: gitleaks
+    name: gitleaks (OSS binary)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Upstream OSS binary — no GITLEAKS_LICENSE, works on org-owned repos.
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=8.21.2
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks detect --source . --redact --verbose --exit-code 1
+
+  mistakes-registry:
+    name: mistakes-registry checks (S1 hook)
+    if: ${{ inputs.run-registry-checks }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Extension point for S1: promoted entries from mistakes-registry/ land here
+      # as executable checks. Contract: if the repo ships `.mistakes-registry/checks.sh`
+      # (or a `mistakes:check` package script), it runs and must exit 0. Until S1
+      # promotes the first rule, this is a green no-op so it can be made a required
+      # check now without blocking anyone.
+      - name: Run promoted registry checks
+        run: |
+          if [ -x .mistakes-registry/checks.sh ]; then
+            echo "Running repo-local mistakes-registry checks…"
+            .mistakes-registry/checks.sh
+          elif [ -f package.json ] && node -e "process.exit(require('./package.json').scripts?.['mistakes:check']?0:1)" 2>/dev/null; then
+            echo "Running 'mistakes:check' package script…"
+            pnpm run mistakes:check
+          else
+            echo "No promoted mistakes-registry checks yet (S1 hook idle) — passing."
+          fi
