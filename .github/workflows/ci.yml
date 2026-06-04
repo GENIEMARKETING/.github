@@ -77,10 +77,16 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # --if-present makes the floor adopt-anywhere: a repo that hasn't defined
-      # the script yet is skipped rather than failing the whole org gate.
+      # Adopt-anywhere: skip cleanly when the repo hasn't defined typecheck yet,
+      # rather than failing the whole org gate. (A bare `--if-present` would be
+      # forwarded to turbo, which rejects unknown flags — so guard explicitly.)
       - name: Typecheck
-        run: pnpm run typecheck --if-present
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.typecheck?0:1)" 2>/dev/null; then
+            pnpm typecheck
+          else
+            echo "No typecheck script — skipping."
+          fi
 
       - name: Biome (lint + format)  # always-on floor
         run: pnpm exec biome ci .
