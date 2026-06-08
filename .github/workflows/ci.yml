@@ -121,8 +121,9 @@ jobs:
       - name: Build (if enabled & defined)
         if: ${{ inputs.run-build }}
         run: |
-          if [ -n "${{ inputs.build-command }}" ]; then
-            ${{ inputs.build-command }}
+          CMD="${{ inputs.build-command }}"
+          if [ -n "$CMD" ]; then
+            eval "$CMD"
           elif node -e "process.exit(require('./package.json').scripts?.build?0:1)" 2>/dev/null; then
             case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm build ;; yarn) yarn build ;; npm) npm run build ;; esac
           else echo "No build script — skipping."; fi
@@ -201,8 +202,9 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build
         run: |
-          if [ -n "${{ inputs.build-command }}" ]; then
-            ${{ inputs.build-command }}
+          CMD="${{ inputs.build-command }}"
+          if [ -n "$CMD" ]; then
+            eval "$CMD"
           else
             case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm build ;; yarn) yarn build ;; npm) npm run build ;; esac
           fi
