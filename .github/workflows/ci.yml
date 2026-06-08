@@ -127,12 +127,23 @@ jobs:
             case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm build ;; yarn) yarn build ;; npm) npm run build ;; esac
           else echo "No build script — skipping."; fi
 
+      # Find the package that OWNS Playwright and run it THERE — never at the
+      # workspace root. In a monorepo, @playwright/test is a devDep of one package
+      # (e.g. @vinny/ui), so `pnpm exec playwright` at the root fails with
+      # ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL. We cd into the config's directory so the
+      # local resolution finds it.
       - name: Detect Playwright
         id: pw
         run: |
-          if [ "${{ inputs.run-e2e }}" = "true" ] && \
-             ls playwright.config.* packages/*/playwright.config.* apps/*/playwright.config.* >/dev/null 2>&1; then
+          dir=""
+          if [ "${{ inputs.run-e2e }}" = "true" ]; then
+            cfg=$(ls playwright.config.* packages/*/playwright.config.* apps/*/playwright.config.* 2>/dev/null | head -1 || true)
+            [ -n "$cfg" ] && dir=$(dirname "$cfg")
+          fi
+          if [ -n "$dir" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "dir=$dir" >> "$GITHUB_OUTPUT"
+            echo "Playwright config found in: $dir"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No Playwright config found (or run-e2e=false) — skipping e2e/a11y."
@@ -140,6 +151,7 @@ jobs:
 
       - name: Install Playwright browsers
         if: steps.pw.outputs.present == 'true'
+        working-directory: ${{ steps.pw.outputs.dir }}
         run: |
           case "${{ steps.pm.outputs.pm }}" in
             pnpm) pnpm exec playwright install --with-deps chromium ;;
@@ -149,6 +161,7 @@ jobs:
 
       - name: Playwright + axe
         if: steps.pw.outputs.present == 'true'
+        working-directory: ${{ steps.pw.outputs.dir }}
         run: |
           case "${{ steps.pm.outputs.pm }}" in
             pnpm) pnpm exec playwright test ;;
@@ -216,7 +229,16 @@ jobs:
           VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
             | tar -xz gitleaks
-          ./gitleaks detect --source . --redact --verbose --exit-code 1
+          # Use the repo's own .gitleaks.toml if it ships one (repos that want the
+          # org rules+allowlist copy the canonical one from GENIEMARKETING/.github);
+          # otherwise scan with gitleaks' default ruleset so every repo still scans.
+          if [ -f .gitleaks.toml ]; then
+            echo "gitleaks: using repo-local .gitleaks.toml"
+            ./gitleaks detect --source . --redact --no-banner --config .gitleaks.toml --exit-code 1
+          else
+            echo "gitleaks: no repo .gitleaks.toml — scanning with default rules"
+            ./gitleaks detect --source . --redact --no-banner --exit-code 1
+          fi
 
   mistakes-registry:
     name: mistakes-registry checks (S1 hook)
