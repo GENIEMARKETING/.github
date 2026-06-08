@@ -1,25 +1,28 @@
 name: Reusable CI
 
-# The org-wide gate DAG every client site references:
-#   typecheck → Biome → Playwright + axe → Lighthouse-CI → gitleaks → mistakes-registry
+# The org-wide gate DAG every repo references:
+#   install → typecheck → Biome → build → Playwright + axe → Lighthouse-CI → gitleaks → mistakes-registry
 # A new enforced check added here applies to every repo at once.
 #
 # Design notes:
 #   - 100% OSS, no paid services. gitleaks runs from the upstream binary
 #     (the gitleaks-action requires a paid GITLEAKS_LICENSE on org repos, so we
 #     avoid it). Lighthouse-CI and axe are OSS.
-#   - Adopt-anywhere: typecheck / build / e2e auto-skip when the repo does not
-#     define them, so a library monorepo (vinny-platform) and a Next.js site can
-#     both call this same workflow. Biome + gitleaks are the always-on floor.
+#   - Package-manager aware: auto-detects pnpm / yarn / npm from the lockfile, so
+#     a pnpm monorepo and a legacy npm/Vite site can both call this one workflow.
+#   - Adopt-anywhere: typecheck / Biome / build / e2e each auto-skip when the repo
+#     doesn't define them (no script, no config) or when turned off by input.
+#     The ALWAYS-ON floor for every repo is gitleaks + the mistakes-registry hook.
+#     => a brand-new bespoke site passes with just the secret scan; a platform
+#        site (vinny-init) runs the full gate. Sites opt into more as they adopt it.
 #
-# Caller usage (in a site repo, .github/workflows/ci.yml):
+# Caller usage — platform site (full gate):
 #   jobs:
 #     ci:
 #       uses: GENIEMARKETING/.github/.github/workflows/ci.yml@main
 #       secrets: inherit
-#       with:
-#         run-e2e: true          # set false for non-Playwright repos
-#         run-lighthouse: true   # set false for libraries / non-served repos
+# Caller usage — legacy site (lightweight floor; build needs no CI secrets):
+#       with: { run-build: false, run-e2e: false, run-lighthouse: false }
 
 on:
   workflow_call:
@@ -28,16 +31,20 @@ on:
         type: string
         default: "22"
       build-command:
+        description: "Explicit build command override. Empty = auto-run the repo's build script."
         type: string
-        default: "pnpm build"
+        default: ""
       start-command:
-        description: "Command that boots the app for Lighthouse (e.g. pnpm start)."
+        description: "Command that boots the app for Lighthouse (e.g. npm start)."
         type: string
-        default: "pnpm start"
+        default: "npm start"
       lighthouse-url:
-        description: "URL Lighthouse-CI collects against once the app is up."
         type: string
         default: "http://localhost:3000"
+      run-build:
+        description: "Run the build. Set false for legacy sites whose build needs secrets not in CI."
+        type: boolean
+        default: true
       run-e2e:
         description: "Run Playwright + axe. Auto-skips anyway if no playwright config is found."
         type: boolean
@@ -59,47 +66,85 @@ concurrency:
 
 jobs:
   quality:
-    name: typecheck · lint · build · a11y
+    name: install · typecheck · lint · build · a11y
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: pnpm/action-setup@v4
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          else pm=npm
+          fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+          echo "Detected package manager: $pm"
 
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+        if: steps.pm.outputs.pm == 'pnpm'
+
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: pnpm
+          cache: ${{ steps.pm.outputs.pm }}
           registry-url: https://npm.pkg.github.com
 
       - name: Install
-        run: pnpm install --frozen-lockfile
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && (yarn install --immutable || yarn install --frozen-lockfile) ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # Adopt-anywhere: skip cleanly when the repo hasn't defined typecheck yet,
-      # rather than failing the whole org gate. (A bare `--if-present` would be
-      # forwarded to turbo, which rejects unknown flags — so guard explicitly.)
-      - name: Typecheck
+      # Each gate below skips cleanly when the repo doesn't define it, so the same
+      # workflow serves a fully-tooled platform site and a bespoke legacy site.
+      - name: Typecheck (if defined)
         run: |
           if node -e "process.exit(require('./package.json').scripts?.typecheck?0:1)" 2>/dev/null; then
-            pnpm typecheck
-          else
-            echo "No typecheck script — skipping."
-          fi
+            case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm typecheck ;; yarn) yarn typecheck ;; npm) npm run typecheck ;; esac
+          else echo "No typecheck script — skipping."; fi
 
-      - name: Biome (lint + format)  # always-on floor
-        run: pnpm exec biome ci .
+      - name: Biome (if configured)
+        run: |
+          if ls biome.json biome.jsonc >/dev/null 2>&1; then
+            case "${{ steps.pm.outputs.pm }}" in
+              pnpm) pnpm exec biome ci . ;;
+              yarn) yarn biome ci . ;;
+              npm)  npx --yes @biomejs/biome ci . ;;
+            esac
+          else echo "No Biome config — skipping (legacy site not yet on the lint floor)."; fi
 
-      - name: Build
-        run: ${{ inputs.build-command }}
+      - name: Build (if enabled & defined)
+        if: ${{ inputs.run-build }}
+        run: |
+          CMD="${{ inputs.build-command }}"
+          if [ -n "$CMD" ]; then
+            eval "$CMD"
+          elif node -e "process.exit(require('./package.json').scripts?.build?0:1)" 2>/dev/null; then
+            case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm build ;; yarn) yarn build ;; npm) npm run build ;; esac
+          else echo "No build script — skipping."; fi
 
+      # Find the package that OWNS Playwright and run it THERE — never at the
+      # workspace root. In a monorepo, @playwright/test is a devDep of one package
+      # (e.g. @vinny/ui), so `pnpm exec playwright` at the root fails with
+      # ERR_PNPM_RECURSIVE_EXEC_FIRST_FAIL. We cd into the config's directory so the
+      # local resolution finds it.
       - name: Detect Playwright
         id: pw
         run: |
-          if [ "${{ inputs.run-e2e }}" = "true" ] && \
-             ls playwright.config.* packages/*/playwright.config.* apps/*/playwright.config.* >/dev/null 2>&1; then
+          dir=""
+          if [ "${{ inputs.run-e2e }}" = "true" ]; then
+            cfg=$(ls playwright.config.* packages/*/playwright.config.* apps/*/playwright.config.* 2>/dev/null | head -1 || true)
+            [ -n "$cfg" ] && dir=$(dirname "$cfg")
+          fi
+          if [ -n "$dir" ]; then
             echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "dir=$dir" >> "$GITHUB_OUTPUT"
+            echo "Playwright config found in: $dir"
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
             echo "No Playwright config found (or run-e2e=false) — skipping e2e/a11y."
@@ -107,45 +152,77 @@ jobs:
 
       - name: Install Playwright browsers
         if: steps.pw.outputs.present == 'true'
-        run: pnpm exec playwright install --with-deps chromium
+        working-directory: ${{ steps.pw.outputs.dir }}
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm exec playwright install --with-deps chromium ;;
+            yarn) yarn playwright install --with-deps chromium ;;
+            npm)  npx playwright install --with-deps chromium ;;
+          esac
 
       - name: Playwright + axe
         if: steps.pw.outputs.present == 'true'
-        run: pnpm exec playwright test
+        working-directory: ${{ steps.pw.outputs.dir }}
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm exec playwright test ;;
+            yarn) yarn playwright test ;;
+            npm)  npx playwright test ;;
+          esac
 
   lighthouse:
     name: Lighthouse-CI budgets
     if: ${{ inputs.run-lighthouse }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          else pm=npm
+          fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6
+        if: steps.pm.outputs.pm == 'pnpm'
+      - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: pnpm
+          cache: ${{ steps.pm.outputs.pm }}
           registry-url: https://npm.pkg.github.com
       - name: Install
-        run: pnpm install --frozen-lockfile
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && (yarn install --immutable || yarn install --frozen-lockfile) ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
         env:
           NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Build
-        run: ${{ inputs.build-command }}
+        run: |
+          CMD="${{ inputs.build-command }}"
+          if [ -n "$CMD" ]; then
+            eval "$CMD"
+          else
+            case "${{ steps.pm.outputs.pm }}" in pnpm) pnpm build ;; yarn) yarn build ;; npm) npm run build ;; esac
+          fi
       - name: Lighthouse-CI
         run: |
-          pnpm exec lhci autorun \
-            --collect.startServerCommand="${{ inputs.start-command }}" \
-            --collect.url="${{ inputs.lighthouse-url }}"
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm exec lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+            yarn) yarn lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+            npm)  npx --yes @lhci/cli autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+          esac
         env:
-          # Optional: status-check posting. Lighthouse-CI itself is OSS and runs
-          # without it; the budget assertions still fail the job on regression.
           LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
 
   secrets-scan:
     name: gitleaks (OSS binary)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
       # Upstream OSS binary — no GITLEAKS_LICENSE, works on org-owned repos.
@@ -154,14 +231,23 @@ jobs:
           VERSION=8.21.2
           curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" \
             | tar -xz gitleaks
-          ./gitleaks detect --source . --redact --verbose --exit-code 1
+          # Use the repo's own .gitleaks.toml if it ships one (repos that want the
+          # org rules+allowlist copy the canonical one from GENIEMARKETING/.github);
+          # otherwise scan with gitleaks' default ruleset so every repo still scans.
+          if [ -f .gitleaks.toml ]; then
+            echo "gitleaks: using repo-local .gitleaks.toml"
+            ./gitleaks detect --source . --redact --no-banner --config .gitleaks.toml --exit-code 1
+          else
+            echo "gitleaks: no repo .gitleaks.toml — scanning with default rules"
+            ./gitleaks detect --source . --redact --no-banner --exit-code 1
+          fi
 
   mistakes-registry:
     name: mistakes-registry checks (S1 hook)
     if: ${{ inputs.run-registry-checks }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       # Extension point for S1: promoted entries from mistakes-registry/ land here
       # as executable checks. Contract: if the repo ships `.mistakes-registry/checks.sh`
       # (or a `mistakes:check` package script), it runs and must exit 0. Until S1
@@ -174,7 +260,7 @@ jobs:
             .mistakes-registry/checks.sh
           elif [ -f package.json ] && node -e "process.exit(require('./package.json').scripts?.['mistakes:check']?0:1)" 2>/dev/null; then
             echo "Running 'mistakes:check' package script…"
-            pnpm run mistakes:check
+            if [ -f pnpm-lock.yaml ]; then pnpm run mistakes:check; elif [ -f yarn.lock ]; then yarn mistakes:check; else npm run mistakes:check; fi
           else
             echo "No promoted mistakes-registry checks yet (S1 hook idle) — passing."
           fi

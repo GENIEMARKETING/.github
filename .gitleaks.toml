@@ -1,0 +1,42 @@
+# gitleaks config — secret scanning in CI (MUST-tier guard).
+# Blocks any plaintext credential from entering git history. Runs on every PR
+# AND as a pre-commit hook (see security/README.md). Extends the upstream
+# default ruleset; adds repo-specific rules + an allowlist for known
+# placeholders / the local-proof-only test password.
+
+title = "agency-infrastructure"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "strapi-app-keys"
+description = "Strapi APP_KEYS / JWT secrets"
+regex = '''(?i)(STRAPI_(APP_KEYS|JWT_SECRET|ADMIN_JWT_SECRET|API_TOKEN_SALT|TRANSFER_TOKEN_SALT))\s*[:=]\s*['"]?[A-Za-z0-9+/]{16,}'''
+tags = ["strapi", "secret"]
+
+[[rules]]
+id = "medusa-secrets"
+description = "Medusa JWT / cookie secrets"
+regex = '''(?i)(MEDUSA_(JWT_SECRET|COOKIE_SECRET))\s*[:=]\s*['"]?[A-Za-z0-9+/]{16,}'''
+tags = ["medusa", "secret"]
+
+[[rules]]
+id = "postgres-url-with-password"
+description = "Postgres connection string with inline password"
+regex = '''postgres(ql)?://[^:@\s]+:[^@\s]{6,}@'''
+tags = ["postgres", "secret"]
+
+[allowlist]
+description = "Placeholders, the documented local-only test password, and encrypted files"
+regexes = [
+  '''__CHANGE_ME__''',
+  '''__KEY[0-9]__''',
+  '''local-proof-only''',                 # documented test password for the RLS proof DB
+  '''postgres://\$\{POSTGRES_USER\}''',    # compose variable interpolation, not a literal
+]
+paths = [
+  '''\.env\.example$''',
+  '''.*\.enc\.env$''',                     # SOPS-encrypted — ciphertext, safe by design
+  '''SETUP-GUIDE\.md$''',                  # documents sk_xxx / whsec_xxx placeholders
+]
