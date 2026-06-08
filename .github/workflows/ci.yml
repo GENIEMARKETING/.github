@@ -74,11 +74,14 @@ jobs:
       - name: Detect package manager
         id: pm
         run: |
-          if [ -f pnpm-lock.yaml ]; then pm=pnpm
-          elif [ -f yarn.lock ]; then pm=yarn
-          else pm=npm
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; cache=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn; cache=yarn
+          elif [ -f package-lock.json ]; then pm=npm; cache=npm
+          else pm=npm; cache=
           fi
           echo "pm=$pm" >> "$GITHUB_OUTPUT"
+          # setup-node's cache requires a lockfile; leave empty when there is none.
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
           echo "Detected package manager: $pm"
 
       - uses: pnpm/action-setup@v6
@@ -87,7 +90,7 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ steps.pm.outputs.pm }}
+          cache: ${{ steps.pm.outputs.cache }}
           registry-url: https://npm.pkg.github.com
 
       - name: Install
@@ -179,17 +182,20 @@ jobs:
       - name: Detect package manager
         id: pm
         run: |
-          if [ -f pnpm-lock.yaml ]; then pm=pnpm
-          elif [ -f yarn.lock ]; then pm=yarn
-          else pm=npm
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; cache=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn; cache=yarn
+          elif [ -f package-lock.json ]; then pm=npm; cache=npm
+          else pm=npm; cache=
           fi
           echo "pm=$pm" >> "$GITHUB_OUTPUT"
+          # setup-node's cache requires a lockfile; leave empty when there is none.
+          echo "cache=$cache" >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@v6
         if: steps.pm.outputs.pm == 'pnpm'
       - uses: actions/setup-node@v6
         with:
           node-version: ${{ inputs.node-version }}
-          cache: ${{ steps.pm.outputs.pm }}
+          cache: ${{ steps.pm.outputs.cache }}
           registry-url: https://npm.pkg.github.com
       - name: Install
         run: |
