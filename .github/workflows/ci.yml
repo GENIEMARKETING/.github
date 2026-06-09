@@ -113,7 +113,7 @@ jobs:
 
       - name: Biome (if configured)
         run: |
-          if ls biome.json biome.jsonc >/dev/null 2>&1; then
+          if [ -f biome.json ] || [ -f biome.jsonc ]; then
             case "${{ steps.pm.outputs.pm }}" in
               pnpm) pnpm exec biome ci . ;;
               yarn) yarn biome ci . ;;
