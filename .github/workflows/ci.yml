@@ -30,6 +30,12 @@ on:
       node-version:
         type: string
         default: "22"
+      biome-version:
+        description: "Exact Biome version CI runs (pin, not 'latest'). MUST match the
+          $schema in the repo's biome.json so a new Biome release can't break a
+          previously-formatted tree. Bump this in lockstep with `biome migrate`."
+        type: string
+        default: "2.4.16"
       build-command:
         description: "Explicit build command override. Empty = auto-run the repo's build script."
         type: string
@@ -112,13 +118,21 @@ jobs:
           else echo "No typecheck script — skipping."; fi
 
       - name: Biome (if configured)
+        # Run an EXACT, pinned Biome version (inputs.biome-version), not the repo's
+        # installed/`latest` Biome. Otherwise a new Biome release (e.g. 2.4.16→2.5.0)
+        # reformats/re-lints a previously-green tree and turns CI red with no code
+        # change (the recurring biome-v2 drift). `npx --yes` fetches the pinned
+        # version regardless of the package manager, so CI no longer depends on the
+        # resolved devDependency. Upgrade deliberately: bump biome-version + run
+        # `biome migrate` + `biome format --write` together.
         run: |
           if [ -f biome.json ] || [ -f biome.jsonc ]; then
-            case "${{ steps.pm.outputs.pm }}" in
-              pnpm) pnpm exec biome ci . ;;
-              yarn) yarn biome ci . ;;
-              npm)  npx --yes @biomejs/biome ci . ;;
-            esac
+            ver='${{ inputs.biome-version }}'
+            echo "Running pinned @biomejs/biome@${ver}"
+            # npx (ships with Node) fetches+runs the pinned version regardless of the
+            # repo's package manager — avoids yarn-classic having no `dlx` and avoids
+            # the resolved devDependency drifting CI.
+            npx --yes @biomejs/biome@"${ver}" ci .
           else echo "No Biome config — skipping (legacy site not yet on the lint floor)."; fi
 
       - name: Build (if enabled & defined)
