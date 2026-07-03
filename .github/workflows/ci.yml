@@ -1,13 +1,14 @@
 name: Reusable CI
 
 # The org-wide gate DAG every repo references:
-#   install → typecheck → Biome → build → Playwright + axe → Lighthouse-CI → gitleaks → mistakes-registry
+#   install → typecheck → Biome → build → Playwright + axe → Lighthouse-CI (+ ZAP baseline)
+#   → dependency audit → gitleaks → mistakes-registry
 # A new enforced check added here applies to every repo at once.
 #
 # Design notes:
 #   - 100% OSS, no paid services. gitleaks runs from the upstream binary
 #     (the gitleaks-action requires a paid GITLEAKS_LICENSE on org repos, so we
-#     avoid it). Lighthouse-CI and axe are OSS.
+#     avoid it). Lighthouse-CI, axe and OWASP ZAP are OSS.
 #   - Package-manager aware: auto-detects pnpm / yarn / npm from the lockfile, so
 #     a pnpm monorepo and a legacy npm/Vite site can both call this one workflow.
 #   - Adopt-anywhere: typecheck / Biome / build / e2e each auto-skip when the repo
@@ -60,6 +61,17 @@ on:
         default: true
       run-registry-checks:
         description: "Run promoted mistakes-registry checks (S1 hook)."
+        type: boolean
+        default: true
+      run-dependency-audit:
+        description: "Audit prod dependencies for known vulnerabilities (high+ fails)."
+        type: boolean
+        default: true
+      run-zap:
+        description: "OWASP ZAP baseline scan (passive DAST) against the built app.
+          Runs inside the Lighthouse job (needs the booted site), so it also
+          requires run-lighthouse. Report always uploads as an artifact; the step
+          fails only on FAIL-level alerts (promote rules via a repo .zap/rules.tsv)."
         type: boolean
         default: true
 
@@ -171,10 +183,12 @@ jobs:
         if: steps.pw.outputs.present == 'true'
         working-directory: ${{ steps.pw.outputs.dir }}
         run: |
+          # chromium + webkit: sites carry a `webkit-iphone` Playwright project
+          # (iPhone Safari coverage) — a chromium-only install would fail it.
           case "${{ steps.pm.outputs.pm }}" in
-            pnpm) pnpm exec playwright install --with-deps chromium ;;
-            yarn) yarn playwright install --with-deps chromium ;;
-            npm)  npx playwright install --with-deps chromium ;;
+            pnpm) pnpm exec playwright install --with-deps chromium webkit ;;
+            yarn) yarn playwright install --with-deps chromium webkit ;;
+            npm)  npx playwright install --with-deps chromium webkit ;;
           esac
 
       - name: Playwright + axe
@@ -188,7 +202,7 @@ jobs:
           esac
 
   lighthouse:
-    name: Lighthouse-CI budgets
+    name: Lighthouse-CI budgets + ZAP baseline
     if: ${{ inputs.run-lighthouse }}
     runs-on: ubuntu-latest
     steps:
@@ -230,13 +244,99 @@ jobs:
           fi
       - name: Lighthouse-CI
         run: |
-          case "${{ steps.pm.outputs.pm }}" in
-            pnpm) pnpm exec lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
-            yarn) yarn lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
-            npm)  npx --yes @lhci/cli autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
-          esac
+          # A repo-local lighthouserc owns the run (its URL list + budgets, e.g.
+          # the SEO/CWV assertions). The workflow inputs only drive repos that
+          # haven't adopted a config yet — passing the CLI flags unconditionally
+          # would override the config's collect.url and silently shrink the
+          # audit to a single page.
+          if [ -f lighthouserc.json ] || [ -f lighthouserc.js ] || [ -f .lighthouserc.json ] || [ -f .lighthouserc.js ]; then
+            echo "lhci: repo lighthouserc found — config drives URLs + budgets"
+            case "${{ steps.pm.outputs.pm }}" in
+              pnpm) pnpm exec lhci autorun ;;
+              yarn) yarn lhci autorun ;;
+              npm)  npx --yes @lhci/cli autorun ;;
+            esac
+          else
+            echo "lhci: no repo lighthouserc — using workflow input flags"
+            case "${{ steps.pm.outputs.pm }}" in
+              pnpm) pnpm exec lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+              yarn) yarn lhci autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+              npm)  npx --yes @lhci/cli autorun --collect.startServerCommand="${{ inputs.start-command }}" --collect.url="${{ inputs.lighthouse-url }}" ;;
+            esac
+          fi
         env:
           LHCI_GITHUB_APP_TOKEN: ${{ secrets.LHCI_GITHUB_APP_TOKEN }}
+
+      # OWASP ZAP baseline (passive DAST: headers, cookies, XSS sinks, mixed
+      # content, exposed info). Reuses this job's build; lhci stops its own
+      # server, so boot the app once more for the scan.
+      - name: Start app for ZAP
+        if: ${{ inputs.run-zap }}
+        run: |
+          nohup ${{ inputs.start-command }} >/tmp/zap-app.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sSf -o /dev/null "${{ inputs.lighthouse-url }}" && exit 0
+            sleep 2
+          done
+          echo "App never became ready for ZAP:"; tail -50 /tmp/zap-app.log; exit 1
+
+      - name: ZAP baseline scan
+        if: ${{ inputs.run-zap }}
+        run: |
+          # Passive rules only — safe against any environment. ZAP's defaults are
+          # all WARN-level; -I keeps warnings non-blocking (they land in the
+          # uploaded report). A repo escalates specific alerts to FAIL by
+          # shipping .zap/rules.tsv — those then red the build.
+          mkdir -p zap-out && chmod 777 zap-out
+          RULES=""
+          if [ -f .zap/rules.tsv ]; then
+            cp .zap/rules.tsv zap-out/rules.tsv
+            RULES="-c rules.tsv"
+            echo "zap: using repo-promoted rules (.zap/rules.tsv)"
+          fi
+          docker run --rm --network host -v "$PWD/zap-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "${{ inputs.lighthouse-url }}" -I $RULES \
+            -r zap-baseline-report.html -w zap-baseline-report.md
+
+      - name: Upload ZAP report
+        if: ${{ always() && inputs.run-zap }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-baseline-report
+          path: zap-out/zap-baseline-report.*
+          if-no-files-found: ignore
+
+  dependency-audit:
+    name: dependency audit (high+ vulns)
+    if: ${{ inputs.run-dependency-audit }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+        if: hashFiles('pnpm-lock.yaml') != ''
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      # Audits read the lockfile and query the public advisory DB — no install
+      # needed. Private @geniemarketing packages aren't in the DB, so they are
+      # skipped, not failed. Gate at high+ so a low/moderate transitive advisory
+      # can't red the whole org at once; prod deps only (devDeps never ship).
+      - name: Audit prod dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm audit --prod --audit-level high
+          elif [ -f yarn.lock ]; then
+            # yarn classic's audit exit code is a severity BITMASK (non-zero even
+            # for low-only findings) — run it as advisory output, don't gate on it.
+            corepack enable
+            yarn audit --level high --groups dependencies \
+              || echo "::warning::yarn audit reported advisories — review the log above"
+          elif [ -f package-lock.json ]; then
+            npm audit --omit=dev --audit-level=high
+          else
+            echo "No lockfile — skipping dependency audit."
+          fi
 
   secrets-scan:
     name: gitleaks (OSS binary)
