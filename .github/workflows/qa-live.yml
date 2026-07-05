@@ -125,7 +125,9 @@ jobs:
             npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
           esac
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Private @geniemarketing/* packages 403 for the default GITHUB_TOKEN;
+          # use the repo's PACKAGES_READ_TOKEN (read:packages PAT) when present.
+          NODE_AUTH_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Sync browsers with the repo's Playwright version
         # No-op when the repo pins the same version as the container tag.
@@ -313,7 +315,9 @@ jobs:
             npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
           esac
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Private @geniemarketing/* packages 403 for the default GITHUB_TOKEN;
+          # use the repo's PACKAGES_READ_TOKEN (read:packages PAT) when present.
+          NODE_AUTH_TOKEN: ${{ secrets.PACKAGES_READ_TOKEN || secrets.GITHUB_TOKEN }}
       - name: Full local suite vs committed baselines
         # Same suite CI runs on push — re-run weekly to catch drift that arrives
         # WITHOUT a commit (CMS content, upstream data, env). Advisory: findings
