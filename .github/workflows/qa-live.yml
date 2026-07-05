@@ -66,6 +66,12 @@ on:
         description: "k6 smoke profile (5 VUs, prod-safe). Never the spike profile here."
         type: boolean
         default: false
+      run-visual-regression:
+        description: "Weekly advisory: full LOCAL suite (build + visual baselines) to
+          catch drift from env/content changes with no commit. Findings file as
+          medium — visual judgment stays with Vinny."
+        type: boolean
+        default: false
       fail-on-findings:
         description: "Red the workflow when a NEW critical/high finding is filed."
         type: boolean
@@ -277,9 +283,57 @@ jobs:
           path: qa-out/
           if-no-files-found: ignore
 
+  visual-regression:
+    name: weekly visual drift (local build, advisory)
+    if: ${{ inputs.run-visual-regression }}
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+    steps:
+      - uses: actions/checkout@v6
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          else pm=npm
+          fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6
+        if: steps.pm.outputs.pm == 'pnpm'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://npm.pkg.github.com
+      - name: Install
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && (yarn install --immutable || yarn install --frozen-lockfile) ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Full local suite vs committed baselines
+        # Same suite CI runs on push — re-run weekly to catch drift that arrives
+        # WITHOUT a commit (CMS content, upstream data, env). Advisory: findings
+        # file as medium, never red the workflow on their own.
+        run: |
+          mkdir -p qa-out
+          npx playwright install --with-deps chromium webkit || true
+          PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-visual-local.json \
+            npx playwright test --reporter=json \
+            || echo "::warning::weekly local regression had failures — findings will be filed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-visual
+          path: qa-out/
+          if-no-files-found: ignore
+
   report:
     name: file bugs + Slack card
-    needs: [live-e2e, lighthouse, zap, linkcheck, k6-smoke]
+    needs: [live-e2e, lighthouse, zap, linkcheck, k6-smoke, visual-regression]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:

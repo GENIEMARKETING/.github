@@ -73,10 +73,11 @@ function pwSuiteName(file = '') {
   if (/checkout/.test(file)) return 'pw-checkout-live';
   if (/consent/.test(file)) return 'pw-consent';
   if (/a11y/.test(file)) return 'pw-a11y';
+  if (/visual|keyframes/.test(file)) return 'pw-visual';
   if (/smoke/.test(file)) return 'pw-smoke';
   return 'pw-live';
 }
-const PW_SEV = { 'pw-checkout-live': 'critical', 'pw-consent': 'critical', 'pw-smoke': 'high', 'pw-a11y': 'high', 'pw-live': 'medium' };
+const PW_SEV = { 'pw-checkout-live': 'critical', 'pw-consent': 'critical', 'pw-smoke': 'high', 'pw-a11y': 'high', 'pw-visual': 'medium', 'pw-live': 'medium' };
 
 function walkPwSuite(suite, out) {
   for (const spec of suite.specs ?? []) {
