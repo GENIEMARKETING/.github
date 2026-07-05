@@ -1,0 +1,364 @@
+name: Reusable live QA
+
+# The org-wide LIVE-SITE QA harness (sibling of ci.yml, which gates code before
+# merge — this one watches the DEPLOYED site). Called by per-site thin callers:
+#   qa-nightly.yml   (cron, staggered per site)   layer: nightly
+#   qa-weekly.yml    (Sunday, deep set)           layer: weekly
+#   qa-postdeploy.yml (workflow_dispatch, n8n)    layer: postdeploy
+#
+# Design notes:
+#   - 100% OSS: Playwright, Lighthouse-CI, OWASP ZAP (passive baseline only —
+#     prod-safe), lychee (link crawl), k6 (smoke profile only vs prod).
+#   - Every suite is continue-on-failure: raw results land in qa-raw-* artifacts
+#     and the `report` job files ONE deduplicated GitHub Issue per unique finding
+#     (label `qa-bot`, fingerprint in the title) via scripts/qa/qa-file-bug.mjs,
+#     then posts a single Slack card. The workflow itself only goes red when a
+#     NEW critical/high finding appears (fail-on-findings).
+#   - Suites auto-skip when the repo lacks the config (playwright.prod.config.ts,
+#     playwright.live.config.ts, lighthouserc.live.json) — adopt-anywhere, like ci.yml.
+#
+# Caller usage (site repo):
+#   jobs:
+#     qa:
+#       uses: GENIEMARKETING/.github/.github/workflows/qa-live.yml@main
+#       secrets: inherit
+#       with: { site-url: "https://touchvodka.com", layer: nightly }
+
+on:
+  workflow_call:
+    inputs:
+      site-url:
+        description: "Deployed origin to test, e.g. https://touchvodka.com"
+        type: string
+        required: true
+      layer:
+        description: "postdeploy | nightly | weekly — recorded in each bug record."
+        type: string
+        default: "nightly"
+      node-version:
+        type: string
+        default: "22"
+      run-live-e2e:
+        description: "Playwright smoke+a11y vs the live site (playwright.prod.config.ts)."
+        type: boolean
+        default: true
+      run-consent:
+        description: "Consent/tracker gate vs live (playwright.live.config.ts)."
+        type: boolean
+        default: true
+      run-checkout-live:
+        description: "Full live checkout flow (creates a sandbox/test order). Off by default."
+        type: boolean
+        default: false
+      run-lighthouse:
+        description: "Lighthouse budgets vs prod URLs (lighthouserc.live.json)."
+        type: boolean
+        default: true
+      run-zap:
+        description: "OWASP ZAP baseline vs prod — PASSIVE only, warnings never gate."
+        type: boolean
+        default: true
+      run-linkcheck:
+        description: "lychee link crawl over the live sitemap."
+        type: boolean
+        default: true
+      run-k6-smoke:
+        description: "k6 smoke profile (5 VUs, prod-safe). Never the spike profile here."
+        type: boolean
+        default: false
+      run-visual-regression:
+        description: "Weekly advisory: full LOCAL suite (build + visual baselines) to
+          catch drift from env/content changes with no commit. Findings file as
+          medium — visual judgment stays with Vinny."
+        type: boolean
+        default: false
+      fail-on-findings:
+        description: "Red the workflow when a NEW critical/high finding is filed."
+        type: boolean
+        default: true
+      qa-tools-ref:
+        description: "Ref of GENIEMARKETING/.github to take qa scripts from (branch testing)."
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: qa-live-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  live-e2e:
+    name: live e2e (smoke · a11y · consent)
+    if: ${{ inputs.run-live-e2e || inputs.run-consent || inputs.run-checkout-live }}
+    runs-on: ubuntu-latest
+    # Official Playwright image = browsers + fonts preinstalled and deterministic.
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          else pm=npm
+          fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v6
+        if: steps.pm.outputs.pm == 'pnpm'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://npm.pkg.github.com
+
+      - name: Install
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && (yarn install --immutable || yarn install --frozen-lockfile) ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync browsers with the repo's Playwright version
+        # No-op when the repo pins the same version as the container tag.
+        run: npx playwright install --with-deps chromium webkit || true
+
+      - name: Smoke + a11y vs live
+        if: ${{ inputs.run-live-e2e }}
+        run: |
+          mkdir -p qa-out
+          if [ -f playwright.prod.config.ts ]; then
+            BASE_URL="${{ inputs.site-url }}" \
+            PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-prod.json \
+              npx playwright test --config playwright.prod.config.ts --reporter=json \
+              || echo "::warning::live e2e had failures — findings will be filed by the report job"
+          else
+            echo "No playwright.prod.config.ts — skipping live smoke/a11y."
+          fi
+
+      - name: Consent gate vs live
+        if: ${{ inputs.run-consent }}
+        run: |
+          mkdir -p qa-out
+          if [ -f playwright.live.config.ts ]; then
+            BASE_URL="${{ inputs.site-url }}" \
+            PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-consent.json \
+              npx playwright test --config playwright.live.config.ts --reporter=json \
+              || echo "::warning::consent suite had failures — findings will be filed"
+          else
+            echo "No playwright.live.config.ts — skipping consent gate."
+          fi
+
+      - name: Checkout flow vs live (sandbox order)
+        if: ${{ inputs.run-checkout-live }}
+        run: |
+          mkdir -p qa-out
+          if [ -f playwright.checkout-live.config.ts ]; then
+            BASE_URL="${{ inputs.site-url }}" \
+            PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-checkout.json \
+              npx playwright test --config playwright.checkout-live.config.ts --reporter=json \
+              || echo "::warning::checkout-live had failures — findings will be filed"
+          else
+            echo "No playwright.checkout-live.config.ts — skipping checkout flow."
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-playwright
+          path: qa-out/
+          if-no-files-found: ignore
+
+  lighthouse:
+    name: lighthouse vs prod
+    if: ${{ inputs.run-lighthouse }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Lighthouse-CI (live URLs, no server boot)
+        run: |
+          mkdir -p qa-out
+          if [ -f lighthouserc.live.json ]; then
+            npx --yes @lhci/cli autorun --config=lighthouserc.live.json \
+              || echo "::warning::lighthouse budgets failed — findings will be filed"
+            cp .lighthouseci/assertion-results.json qa-out/lighthouse-assertions.json 2>/dev/null || true
+          else
+            echo "No lighthouserc.live.json — skipping prod Lighthouse."
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-lighthouse
+          path: qa-out/
+          if-no-files-found: ignore
+
+  zap:
+    name: ZAP baseline vs prod (passive)
+    if: ${{ inputs.run-zap }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: ZAP baseline scan
+        run: |
+          mkdir -p qa-out && chmod 777 qa-out
+          # Passive rules only, warnings never fail (-I) — prod-safe by design.
+          docker run --rm -v "$PWD/qa-out:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
+            -t "${{ inputs.site-url }}" -I \
+            -J zap.json -w zap.md -r zap.html || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-zap
+          path: qa-out/
+          if-no-files-found: ignore
+
+  linkcheck:
+    name: link crawl (lychee)
+    if: ${{ inputs.run-linkcheck }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Crawl sitemap with lychee (OSS binary)
+        run: |
+          mkdir -p qa-out
+          VERSION=0.18.1
+          curl -sSfL "https://github.com/lycheeverse/lychee/releases/download/lychee-v${VERSION}/lychee-x86_64-unknown-linux-gnu.tar.gz" | tar -xz lychee
+          # URL list = the live sitemap; fall back to the homepage if none.
+          curl -sf "${{ inputs.site-url }}/sitemap.xml" | grep -oE '<loc>[^<]+' | sed 's/<loc>//' > all-urls.txt || true
+          [ -s all-urls.txt ] || echo "${{ inputs.site-url }}" > all-urls.txt
+          TOTAL=$(wc -l < all-urls.txt)
+          head -200 all-urls.txt > urls.txt
+          [ "$TOTAL" -gt 200 ] && echo "::warning::sitemap has $TOTAL URLs; crawling first 200"
+          # Throttled — this crawls the LIVE site on shared infra.
+          ./lychee --no-progress --max-concurrency 4 --timeout 20 \
+            --exclude-mail --exclude-all-private \
+            --format json --output qa-out/lychee.json \
+            $(cat urls.txt) || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-linkcheck
+          path: qa-out/
+          if-no-files-found: ignore
+
+  k6-smoke:
+    name: k6 smoke (prod-safe)
+    if: ${{ inputs.run-k6-smoke }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout QA tools (this org's .github repo)
+        uses: actions/checkout@v6
+        with:
+          repository: GENIEMARKETING/.github
+          ref: ${{ inputs.qa-tools-ref }}
+          path: qa-tools
+      - uses: grafana/setup-k6-action@v1
+      - name: k6 checkout-latency (PROFILE=smoke only)
+        # The spike profile is deliberately NOT reachable from here — the shared
+        # Medusa serves every brand; spikes are operator-triggered against staging.
+        run: |
+          mkdir -p qa-out
+          # A threshold breach exits non-zero → drop a marker the bug filer keys on
+          # (the legacy summary-export threshold booleans are ambiguous; exit code isn't).
+          k6 run qa-tools/scripts/qa/checkout-latency.js \
+            -e TARGET_ORIGIN="${{ inputs.site-url }}" \
+            -e PROFILE=smoke \
+            -e PUBLISHABLE_KEY="${{ secrets.MEDUSA_PUBLISHABLE_KEY }}" \
+            --summary-export qa-out/k6-summary.json \
+            || { echo '{"failed":true}' > qa-out/k6-failed.json; echo "::warning::k6 thresholds breached — findings will be filed"; }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-k6
+          path: qa-out/
+          if-no-files-found: ignore
+
+  visual-regression:
+    name: weekly visual drift (local build, advisory)
+    if: ${{ inputs.run-visual-regression }}
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:v1.60.0-noble
+    steps:
+      - uses: actions/checkout@v6
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm
+          elif [ -f yarn.lock ]; then pm=yarn
+          else pm=npm
+          fi
+          echo "pm=$pm" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6
+        if: steps.pm.outputs.pm == 'pnpm'
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://npm.pkg.github.com
+      - name: Install
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) corepack enable && (yarn install --immutable || yarn install --frozen-lockfile) ;;
+            npm)  if [ -f package-lock.json ]; then npm ci; else npm install; fi ;;
+          esac
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Full local suite vs committed baselines
+        # Same suite CI runs on push — re-run weekly to catch drift that arrives
+        # WITHOUT a commit (CMS content, upstream data, env). Advisory: findings
+        # file as medium, never red the workflow on their own.
+        run: |
+          mkdir -p qa-out
+          npx playwright install --with-deps chromium webkit || true
+          PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-visual-local.json \
+            npx playwright test --reporter=json \
+            || echo "::warning::weekly local regression had failures — findings will be filed"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qa-raw-visual
+          path: qa-out/
+          if-no-files-found: ignore
+
+  report:
+    name: file bugs + Slack card
+    needs: [live-e2e, lighthouse, zap, linkcheck, k6-smoke, visual-regression]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout QA tools (this org's .github repo)
+        uses: actions/checkout@v6
+        with:
+          repository: GENIEMARKETING/.github
+          ref: ${{ inputs.qa-tools-ref }}
+          path: qa-tools
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: qa-raw-*
+          path: qa-raw
+          merge-multiple: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: File deduplicated bug issues + Slack summary
+        run: node qa-tools/scripts/qa/qa-file-bug.mjs
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QA_SLACK_WEBHOOK: ${{ secrets.QA_SLACK_WEBHOOK }}
+          QA_REPO: ${{ github.repository }}
+          QA_SITE_URL: ${{ inputs.site-url }}
+          QA_LAYER: ${{ inputs.layer }}
+          QA_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          QA_RAW_DIR: qa-raw
+          QA_FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
