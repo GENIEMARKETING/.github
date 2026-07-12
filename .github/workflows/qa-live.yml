@@ -172,7 +172,7 @@ jobs:
             echo "No playwright.checkout-live.config.ts — skipping checkout flow."
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-playwright
@@ -198,7 +198,7 @@ jobs:
           else
             echo "No lighthouserc.live.json — skipping prod Lighthouse."
           fi
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-lighthouse
@@ -218,7 +218,7 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable zap-baseline.py \
             -t "${{ inputs.site-url }}" -I \
             -J zap.json -w zap.md -r zap.html || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-zap
@@ -246,7 +246,7 @@ jobs:
             --exclude-mail --exclude-all-private \
             --format json --output qa-out/lychee.json \
             $(cat urls.txt) || true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-linkcheck
@@ -278,7 +278,7 @@ jobs:
             -e PUBLISHABLE_KEY="${{ secrets.MEDUSA_PUBLISHABLE_KEY }}" \
             --summary-export qa-out/k6-summary.json \
             || { echo '{"failed":true}' > qa-out/k6-failed.json; echo "::warning::k6 thresholds breached — findings will be filed"; }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-k6
@@ -328,7 +328,7 @@ jobs:
           PLAYWRIGHT_JSON_OUTPUT_NAME=qa-out/pw-visual-local.json \
             npx playwright test --reporter=json \
             || echo "::warning::weekly local regression had failures — findings will be filed"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: qa-raw-visual
@@ -347,7 +347,7 @@ jobs:
           repository: GENIEMARKETING/.github
           ref: ${{ inputs.qa-tools-ref }}
           path: qa-tools
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: qa-raw-*
           path: qa-raw
