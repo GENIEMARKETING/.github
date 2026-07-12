@@ -87,7 +87,7 @@ jobs:
     name: install · typecheck · lint · build · a11y
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Detect package manager
         id: pm
@@ -206,7 +206,7 @@ jobs:
     if: ${{ inputs.run-lighthouse }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Detect package manager
         id: pm
         run: |
@@ -312,7 +312,7 @@ jobs:
     if: ${{ inputs.run-dependency-audit }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
         if: hashFiles('pnpm-lock.yaml') != ''
       - uses: actions/setup-node@v6
@@ -342,7 +342,7 @@ jobs:
     name: gitleaks (OSS binary)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       # Upstream OSS binary — no GITLEAKS_LICENSE, works on org-owned repos.
@@ -367,7 +367,7 @@ jobs:
     if: ${{ inputs.run-registry-checks }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       # Extension point for S1: promoted entries from mistakes-registry/ land here
       # as executable checks. Contract: if the repo ships `.mistakes-registry/checks.sh`
       # (or a `mistakes:check` package script), it runs and must exit 0. Until S1
