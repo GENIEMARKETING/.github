@@ -96,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     # Official Playwright image = browsers + fonts preinstalled and deterministic.
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
     steps:
       - uses: actions/checkout@v6
 
@@ -290,7 +290,7 @@ jobs:
     if: ${{ inputs.run-visual-regression }}
     runs-on: ubuntu-latest
     container:
-      image: mcr.microsoft.com/playwright:v1.60.0-noble
+      image: mcr.microsoft.com/playwright:v1.61.1-noble
     steps:
       - uses: actions/checkout@v6
       - name: Detect package manager
